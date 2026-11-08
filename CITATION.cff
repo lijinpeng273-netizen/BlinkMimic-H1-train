@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use BlinkMimic, please cite it as below."
+title: "BlinkMimic: Whole-Body Motion Tracking for the Unitree G1 in Minutes on One GPU"
+authors:
+  - family-names: Chen
+    given-names: Fuyi
+version: 1.0.0
+date-released: 2026-11-02
+license: MIT
+repository-code: "https://github.com/fuyichen0725/blinkmimic"

@@ -1,0 +1,152 @@
+"""Tracking-accuracy and contact metrics for a set of checkpoints (same rollout protocol as the evaluator:
+each clip once from its first frame, friction 1.0, no randomization or noise, deterministic policy).
+
+Per checkpoint, averaged over alive control steps of the selected motions:
+  body_pos_cm   RMS error of the configured tracked bodies (reference re-anchored to the tracking anchor)
+  body_ori_deg  RMS orientation error of the tracked bodies
+  root_pos_cm   global root position error (drift)
+  joint_deg     mean absolute joint-angle error
+  slip_cm_s     horizontal foot speed while the configured foot geometry is in contact
+  ref_slip_cm_s the same on the reference motion (retargeting artifacts set a floor)
+  contact_acc   fraction of foot-frames whose contact state matches the reference
+  pen_mm        ground penetration proxy (H1 mesh bounds / G1 ankle origin)
+  root_planar_cm / root_heading_deg / joint_per_name_deg: global drift and individual joints
+plus normalized return and failed clips.
+
+    uv run python tools/eval_metrics.py logs/<run_a>/ckpt_003500.pt logs/<run_b>/ckpt_003500.pt --out results/metrics
+"""
+
+import argparse
+import json
+import os
+
+parser = argparse.ArgumentParser()
+parser.add_argument("ckpts", nargs="+")
+parser.add_argument("--robot", type=str, default="g1")
+parser.add_argument("--motion_dir", type=str, default=None)
+parser.add_argument("--motion_manifest", type=str, default=None)
+parser.add_argument("--out", type=str, default="results/metrics")
+args = parser.parse_args()
+
+import torch
+
+import blinkmimic.networks as networks
+from blinkmimic.dr import XiLayout
+from blinkmimic.env import TrackingSim, make_sim
+from blinkmimic.kinematics import Kinematics
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP
+from blinkmimic.motion import MotionLib
+from blinkmimic.networks import Policy, policy_kwargs
+from blinkmimic.robot import get_robot
+from blinkmimic.checkpoint import validate_checkpoint
+
+torch.backends.cuda.matmul.allow_tf32 = True
+dev = "cuda:0"
+robot = get_robot(args.robot)
+kin = Kinematics(robot, dev)
+motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_manifest)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+C = len(motion.names)
+FEET = kin.feet
+if not FEET:
+    raise ValueError("Contact metrics require RobotSpec.foot_bodies")
+
+
+def load_policy(ck):
+    validate_checkpoint(ck, robot)
+    a_ = ck["args"]
+    widths = lambda key: tuple(int(x) for x in a_.get(key, "2048,1024,512,256").split(","))  # noqa: E731
+    pi = Policy(mdp.obs_dim, motion.goal_dim(a_["goal_frames"]), robot.num_joints, hist=a_["hist"],
+                enc_hidden=widths("enc_hidden"), dec_hidden=widths("dec_hidden"), **policy_kwargs(a_, robot)).to(dev)  # fmt: skip
+    pi.load_state_dict(ck["pi"])
+    return pi.eval()
+
+
+@torch.no_grad()
+def run(cks):
+    M = len(cks)
+    N = C * M
+    env = TrackingSim(make_sim(robot), N, robot, motion, mdp, dev, eval_mode=True, randomize=False)
+    pis = [load_policy(ck) for ck in cks]
+    K, Hh = cks[0]["args"]["goal_frames"], cks[0]["args"]["hist"]
+    networks.AMP_DTYPE = torch.bfloat16 if cks[0]["args"].get("amp", "none") == "bf16" else None
+    clip_of = torch.arange(N, device=dev) % C
+    env.reset(torch.arange(N, device=dev), motion.clip_start[clip_of].clone())
+    clip_end = motion.clip_end[clip_of]
+    keys = ("n", "ret", "pos", "ori", "root", "joint", "slip", "slip_n", "ref_slip", "ref_slip_n", "c_ok", "c_n", "pen", "planar", "heading")
+    acc = {k: torch.zeros(N, device=dev) for k in keys}
+    joint_acc = torch.zeros(N, robot.num_joints, device=dev)
+    hist, a = None, torch.zeros(N, robot.num_joints, device=dev)
+    while not bool(env.done_eval.all()):
+        o = env.observe()
+        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+        g = motion.goal(env.f, K)
+        for m, pi in enumerate(pis):
+            sl = slice(m * C, (m + 1) * C)
+            a[sl] = pi(hist[sl], g[sl])
+        alive = (~env.done_eval).float()
+        f1 = env.f + 1
+        out = env.step(a)
+        S1 = env.state()
+        t = out["terms"]
+        bp, bR, bv, bw = kin.forward(*S1)
+        fz, fv3 = kin.foot_kinematics(bp, bR, bv, bw)
+        rz, rv3 = kin.foot_kinematics(motion.body_p[f1], motion.body_R[f1], motion.body_v[f1], motion.body_w[f1])
+        fv, rv = fv3[..., :2].norm(dim=-1), rv3[..., :2].norm(dim=-1)
+        c_sim, c_ref = fz < robot.contact_height, rz < robot.contact_height
+        acc["n"] += alive
+        acc["ret"] += alive * out["r"]
+        acc["pos"] += alive * t["e_body_pos"]
+        acc["ori"] += alive * t["e_body_ori"]
+        acc["root"] += alive * (S1[0] - motion.root_p[f1]).norm(dim=-1)
+        acc["planar"] += alive * (S1[0][..., :2] - motion.root_p[f1][..., :2]).norm(dim=-1)
+        yaw = torch.atan2(S1[1][..., 1, 0], S1[1][..., 0, 0])
+        ref_yaw = torch.atan2(motion.root_R[f1][..., 1, 0], motion.root_R[f1][..., 0, 0])
+        acc["heading"] += alive * torch.atan2(torch.sin(yaw - ref_yaw), torch.cos(yaw - ref_yaw)).abs()
+        joint_acc += alive[:, None] * (S1[4] - motion.q[f1]).abs()
+        acc["joint"] += alive * (S1[4] - motion.q[f1]).abs().mean(-1)
+        acc["slip"] += alive * (fv * c_sim).sum(-1)
+        acc["slip_n"] += alive * c_sim.float().sum(-1)
+        acc["ref_slip"] += alive * (rv * c_ref).sum(-1)
+        acc["ref_slip_n"] += alive * c_ref.float().sum(-1)
+        acc["c_ok"] += alive * (c_sim == c_ref).float().sum(-1)
+        acc["c_n"] += alive * len(FEET)
+        acc["pen"] += alive * (robot.flat_foot_height - fz).clamp(min=0).mean(-1)
+        env.f = torch.minimum(env.f, clip_end - 1)
+    clip_len = motion.clip_len[clip_of]
+    res = []
+    for m in range(M):
+        s = {k: v[m * C : (m + 1) * C].sum().item() for k, v in acc.items()}
+        n = s["n"]
+        res.append({
+            "norm_return": (acc["ret"][m * C : (m + 1) * C] / ((clip_len[m * C : (m + 1) * C] - 1).float() * MAX_STEP_REWARD)).mean().item(),
+            "n_failed": int(env.failed_eval[m * C : (m + 1) * C].sum().item()),
+            "body_pos_cm": 100 * (s["pos"] / n) ** 0.5,
+            "body_ori_deg": 57.2958 * (s["ori"] / n) ** 0.5,
+            "root_pos_cm": 100 * s["root"] / n,
+            "root_planar_cm": 100 * s["planar"] / n,
+            "root_heading_deg": 57.2958 * s["heading"] / n,
+            "joint_per_name_deg": dict(zip(robot.joint_names, (57.2958 * joint_acc[m * C : (m + 1) * C].sum(0) / n).tolist())),
+            "motion_identity": motion.identity,
+            "contact_geometry": "mesh bounding-box corners" if robot.foot_collision_geoms else "ankle origin",
+            "joint_deg": 57.2958 * s["joint"] / n,
+            "slip_cm_s": 100 * s["slip"] / max(s["slip_n"], 1),
+            "ref_slip_cm_s": 100 * s["ref_slip"] / max(s["ref_slip_n"], 1),
+            "contact_acc": s["c_ok"] / s["c_n"],
+            "pen_mm": 1000 * s["pen"] / n,
+        })  # fmt: skip
+    return res
+
+
+cks = [torch.load(p, map_location=dev, weights_only=False) for p in args.ckpts]
+res = run(cks)
+cols = ["norm_return", "n_failed", "body_pos_cm", "body_ori_deg", "root_pos_cm", "root_planar_cm", "root_heading_deg", "joint_deg", "slip_cm_s", "ref_slip_cm_s", "contact_acc", "pen_mm"]
+lines = ["| checkpoint | train h | " + " | ".join(cols) + " |", "|---" * (len(cols) + 2) + "|"]
+for p, ck, r in zip(args.ckpts, cks, res):
+    name = f"{os.path.basename(os.path.dirname(p))}/{os.path.basename(p)}"
+    lines.append(f"| {name} | {ck['wall_time'] / 3600:.2f} | " + " | ".join(f"{r[c]:.3f}" if isinstance(r[c], float) else str(r[c]) for c in cols) + " |")
+table = "\n".join(lines)
+print(table)
+os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+open(args.out + ".md", "w").write(table + "\n")
+json.dump({p: r for p, r in zip(args.ckpts, res)}, open(args.out + ".json", "w"), indent=1)
